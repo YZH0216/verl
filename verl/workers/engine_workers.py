@@ -52,20 +52,79 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
+from verl.workers.utils.batch_adapter import (
+    EngineBatchSpec,
+    batch_to_cpu,
+    run_engine_batch,
+    set_batch_control_fields,
+)
 from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Engine input contracts. These are public verl TensorDict field names; batch
+# adapters decide how the fields are transported and materialized.
+_BASE_ENGINE_KEYS = (
+    "input_ids",
+    "attention_mask",
+    "position_ids",
+    "response_mask",
+    "prompts",
+    "responses",
+)
+_COMMON_ENGINE_KEYS = (
+    "temperature",
+    "compute_loss",
+    "calculate_entropy",
+    "calculate_sum_pi_squared",
+    "no_lora_adapter",
+    "disable_auto_offload",
+    "enable_routing_replay",
+    "global_token_num",
+    "images_seqlens",
+    "multi_modal_inputs",
+    "routed_experts",
+    "teacher_ids",
+    "teacher_logprobs",
+)
+_INFER_BATCH_SPEC = EngineBatchSpec(
+    required_keys=_BASE_ENGINE_KEYS,
+    optional_keys=_COMMON_ENGINE_KEYS,
+    restore_padding_keys=("values", "log_probs", "entropy", "sum_pi_squared"),
+)
+_TRAIN_BATCH_SPEC = EngineBatchSpec(
+    required_keys=_BASE_ENGINE_KEYS,
+    optional_keys=_COMMON_ENGINE_KEYS
+    + (
+        "old_log_probs",
+        "advantages",
+        "values",
+        "returns",
+        "ref_log_prob",
+        "rollout_is_weights",
+        "mini_batch_size",
+        "num_mini_batch",
+        "epochs",
+        "seed",
+        "dataloader_kwargs",
+        "global_batch_size",
+        "multi_turn",
+        "update_lr_scheduler",
+        "distillation_use_topk",
+        "distillation_only",
+    ),
+)
+
 
 def _with_routing_replay_flag(enabled: bool):
-    """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
+    """Decorator to set the routing replay control on any batch container."""
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, data: TensorDict, *args, **kwargs):
             if self.enable_routing_replay:
-                tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
+                set_batch_control_fields(data, enable_routing_replay=enabled)
             return func(self, data, *args, **kwargs)
 
         return wrapper
@@ -240,6 +299,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Returns:
 
         """
+        return run_engine_batch(data, self._train_mini_batch_impl, _TRAIN_BATCH_SPEC)
+
+    def _train_mini_batch_impl(self, data: TensorDict) -> TensorDict:
         maybe_fix_3d_position_ids(data)
         batch_size_per_dp = data.shape[0]
         disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
@@ -379,6 +441,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def infer_batch(self, data: TensorDict) -> TensorDict:
+        return run_engine_batch(data, self._infer_batch_impl, _INFER_BATCH_SPEC)
+
+    def _infer_batch_impl(self, data: TensorDict) -> TensorDict:
         # add mfu calculator
         global_token_num = tu.get(data, key="global_token_num")
         compute_loss = tu.get(data, key="compute_loss", default=True)
@@ -640,22 +705,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.ref.infer_batch(data=data)
-        return output.cpu() if output is not None else None
+        return batch_to_cpu(output)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.actor.infer_batch(data)
-
-        return output.cpu() if output is not None else None
+        return batch_to_cpu(output)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
-        return output.cpu() if output is not None else None
+        return batch_to_cpu(output)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):

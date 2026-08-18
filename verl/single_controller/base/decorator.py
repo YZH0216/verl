@@ -72,31 +72,36 @@ def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
 
     splitted_args = []
     for arg in args:
-        assert BatchData(arg).is_chunkable(), f"arg of type {type(arg)} is not chunkable"
-        chunked_arg = BatchData(arg).chunk(chunks=chunks)
+        batch_data = BatchData(arg)
+        assert batch_data.is_chunkable(), f"arg of type {type(arg)} is not chunkable"
+        chunked_arg = batch_data.chunk(chunks=chunks)
         assert len(chunked_arg) == chunks
+        batch_data.prepare_dispatch(chunked_arg)
         splitted_args.append(chunked_arg)
 
     splitted_kwargs = {}
     for key, val in kwargs.items():
-        assert BatchData(val).is_chunkable(), f"kwarg '{key}' of type {type(val)} is not chunkable"
-        chunked_kwarg = BatchData(val).chunk(chunks=chunks)
+        batch_data = BatchData(val)
+        assert batch_data.is_chunkable(), f"kwarg '{key}' of type {type(val)} is not chunkable"
+        chunked_kwarg = batch_data.chunk(chunks=chunks)
         assert len(chunked_kwarg) == chunks
+        batch_data.prepare_dispatch(chunked_kwarg)
         splitted_kwargs[key] = chunked_kwarg
 
     return splitted_args, splitted_kwargs
 
 
 def _split_args_kwargs_data_proto_with_auto_padding(chunks, *args, **kwargs):
-    from verl.protocol import DataProto, DataProtoFuture
+    from verl.protocol import BatchData, DataProtoFuture
 
     data_proto_len = None
     padding_size = None
 
     def _padding_and_split_data(obj, chunks):
         nonlocal data_proto_len, padding_size
-        assert isinstance(obj, DataProto | DataProtoFuture)
-        if isinstance(obj, DataProto) and obj.is_padding_enabled():
+        batch_data = BatchData(obj)
+        assert batch_data.is_chunkable()
+        if not isinstance(obj, DataProtoFuture) and hasattr(obj, "is_padding_enabled") and obj.is_padding_enabled():
             # for padding, we only support DataProto with same length
             if data_proto_len is None:
                 data_proto_len = len(obj)
@@ -106,7 +111,9 @@ def _split_args_kwargs_data_proto_with_auto_padding(chunks, *args, **kwargs):
                     f"expecting all arg share same length of {data_proto_len}, but got {len(obj)}"
                 )
             obj.padding(padding_size=padding_size)
-        return obj.chunk(chunks=chunks)
+        chunked = batch_data.chunk(chunks=chunks)
+        batch_data.prepare_dispatch(chunked)
+        return chunked
 
     splitted_args = [_padding_and_split_data(arg, chunks) for arg in args]
     splitted_kwargs = {key: _padding_and_split_data(val, chunks) for key, val in kwargs.items()}

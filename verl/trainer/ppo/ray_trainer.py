@@ -41,6 +41,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.data_plane import build_data_plane
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -59,7 +60,6 @@ from verl.trainer.ppo.utils import (
     need_reward_model,
     need_teacher_policy,
 )
-from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -72,7 +72,6 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
-from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -224,8 +223,11 @@ def compute_advantage(
             gamma=gamma,
             lam=lam,
         )
+        advantages = advantages.detach().contiguous().clone()
+        returns = returns.detach().contiguous().clone()
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        data.clear_cache()
         if config.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
@@ -328,6 +330,10 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        # dataplane switch
+        self.data_plane = build_data_plane(config)
+        self.data_proto_cls = self.data_plane.data_proto_cls
+        print(f"RayPPOTrainer data_proto_cls={self.data_proto_cls.__module__}.{self.data_proto_cls.__name__}")
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -605,7 +611,7 @@ class RayPPOTrainer:
         sample_uids = []
 
         for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
+            test_batch = self.data_proto_cls.from_single_dict(test_data)
 
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(
@@ -1211,79 +1217,112 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _dump_correctness_tensors(self, batch: DataProto, dump_dir: str) -> None:
+        """Persist a test-only semantic snapshot immediately before PPO updates."""
+        tensor_keys = (
+            "prompts",
+            "responses",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "response_mask",
+            "rollout_log_probs",
+            "old_log_probs",
+            "ref_log_prob",
+            "values",
+            "token_level_scores",
+            "token_level_rewards",
+            "advantages",
+            "returns",
+        )
+        tensors = {}
+        present_keys = set(batch.batch.keys())
+        for key in tensor_keys:
+            if key in present_keys:
+                value = batch.batch[key]
+                tensors[key] = value.detach().cpu().contiguous().clone()
+
+        non_tensors = {}
+        for key in ("index", "data_source", "reward_model"):
+            if key in batch.non_tensor_batch:
+                non_tensors[key] = np.asarray(batch.non_tensor_batch[key]).copy()
+
+        if "uid" in batch.non_tensor_batch:
+            uid_to_group = {}
+            canonical_groups = []
+            for uid in batch.non_tensor_batch["uid"]:
+                uid_to_group.setdefault(uid, len(uid_to_group))
+                canonical_groups.append(uid_to_group[uid])
+            non_tensors["uid_group"] = np.asarray(canonical_groups, dtype=np.int64)
+
+        os.makedirs(dump_dir, exist_ok=True)
+        output_path = os.path.join(dump_dir, f"{self.global_steps}.pt")
+        torch.save(
+            {
+                "global_step": self.global_steps,
+                "tensors": tensors,
+                "non_tensors": non_tensors,
+            },
+            output_path,
+        )
+        print(f"NEOPROTO_CORRECTNESS_DUMP={output_path} tensor_keys={sorted(tensors)}")
+
     def _compute_values(self, batch: DataProto) -> DataProto:
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to nopadding
-        batch_td = left_right_2_no_padding(batch_td)
-        # step 3: add meta info
-        tu.assign_non_tensor(batch_td, compute_loss=False)
-        output = self.critic_wg.infer_batch(batch_td)
+        prepared = self.data_plane.prepare_inference(batch, {"compute_loss": False})
+        output = self.critic_wg.infer_batch(prepared.payload)
         output = output.get()
-        values = tu.get(output, "values")
-        values = no_padding_2_padding(values, batch_td)
-        values = tu.get_tensordict({"values": values.float()})
-        values = DataProto.from_tensordict(values)
-        return values
+        return self.data_plane.collect_inference(
+            output,
+            prepared,
+            {"values": "values"},
+            restore_keys=("values",),
+            fp32_keys=("values",),
+        )
 
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
-        # step 1: convert dataproto to tensordict.
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to nopadding
-        batch_td = left_right_2_no_padding(batch_td)
-        # step 3: add meta info
         metadata = {"calculate_entropy": False, "compute_loss": False}
         if self.ref_in_actor:
             metadata["no_lora_adapter"] = True
-        tu.assign_non_tensor(batch_td, **metadata)
-        if self.ref_in_actor:
-            output = self.actor_rollout_wg.compute_log_prob(batch_td)
-        else:
-            output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
-        # gather output
-        log_probs = tu.get(output, "log_probs")
-        # step 4. No padding to padding
-        log_probs = no_padding_2_padding(log_probs, batch_td)
-        # step 5: rebuild a tensordict and convert to dataproto
-        ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
-        ref_log_prob = DataProto.from_tensordict(ref_log_prob)
 
-        return ref_log_prob
+        prepared = self.data_plane.prepare_inference(batch, metadata)
+        if self.ref_in_actor:
+            output = self.actor_rollout_wg.compute_log_prob(prepared.payload)
+        else:
+            output = self.ref_policy_wg.compute_ref_log_prob(prepared.payload)
+        return self.data_plane.collect_inference(
+            output,
+            prepared,
+            {"log_probs": "ref_log_prob"},
+            restore_keys=("log_probs",),
+            fp32_keys=("log_probs",),
+        )
 
     def _compute_old_log_prob(self, batch: DataProto):
-        # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
-        # step 1: convert dataproto to tensordict.
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to nopadding
-        batch_td = left_right_2_no_padding(batch_td)
-        # step 3: add meta info
         calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
-        tu.assign_non_tensor(
-            batch_td,
-            calculate_entropy=True,
-            calculate_sum_pi_squared=calculate_sum_pi_squared,
-            compute_loss=False,
-        )
-        output = self.actor_rollout_wg.compute_log_prob(batch_td)
-        # gather output
-        entropy = tu.get(output, "entropy")
-        log_probs = tu.get(output, "log_probs")
-        routed_experts = tu.get(output, "routed_experts")
-        sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
 
-        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
-        # step 4. No padding to padding
-        entropy = no_padding_2_padding(entropy, batch_td)
-        log_probs = no_padding_2_padding(log_probs, batch_td)
-        if sum_pi_squared is not None:
-            sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
-        # step 5: rebuild a tensordict and convert to dataproto
-        result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
-        if routed_experts is not None:
-            result["routed_experts"] = routed_experts
-        if sum_pi_squared is not None:
-            result["sum_pi_squared"] = sum_pi_squared.float()
-        old_log_prob = tu.get_tensordict(result)
-        old_log_prob = DataProto.from_tensordict(old_log_prob)
+        prepared = self.data_plane.prepare_inference(
+            batch,
+            {
+                "calculate_entropy": True,
+                "calculate_sum_pi_squared": calculate_sum_pi_squared,
+                "compute_loss": False,
+            },
+        )
+        output = self.actor_rollout_wg.compute_log_prob(prepared.payload)
+        output_keys = set(output.keys())
+        key_map = {"log_probs": "old_log_probs", "entropy": "entropys"}
+        if "routed_experts" in output_keys:
+            key_map["routed_experts"] = "routed_experts"
+        if calculate_sum_pi_squared and "sum_pi_squared" in output_keys:
+            key_map["sum_pi_squared"] = "sum_pi_squared"
+        old_log_prob = self.data_plane.collect_inference(
+            output,
+            prepared,
+            key_map,
+            restore_keys=("log_probs", "entropy", "sum_pi_squared"),
+            fp32_keys=("log_probs", "entropy", "sum_pi_squared"),
+        )
+        old_log_prob_mfu = self.data_plane.collect_metrics(output)["mfu"]
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
@@ -1291,10 +1330,6 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
-        # update actor
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to no-padding
-        batch_td = left_right_2_no_padding(batch_td)
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
@@ -1316,8 +1351,7 @@ class RayPPOTrainer:
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
-        tu.assign_non_tensor(
-            batch_td,
+        actor_meta = dict(
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
             distillation_only=distillation_only,
@@ -1328,26 +1362,25 @@ class RayPPOTrainer:
             dataloader_kwargs={"shuffle": shuffle},
             compute_loss=True,
         )
-        actor_output = self.actor_rollout_wg.update_actor(batch_td)
-        actor_output = tu.get(actor_output, "metrics")
+
+        prepared = self.data_plane.prepare_training(batch, actor_meta)
+        actor_output = self.actor_rollout_wg.update_actor(prepared.payload)
+        actor_output = self.data_plane.collect_metrics(actor_output)
+
         actor_output = rename_dict(actor_output, "actor/")
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
-        actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+        actor_output = batch.new_like(meta_info={"metrics": actor_output})
 
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to no-padding
-        batch_td = left_right_2_no_padding(batch_td)
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         ppo_epochs = self.config.critic.ppo_epochs
         seed = self.config.critic.data_loader_seed
         shuffle = self.config.critic.shuffle
-        tu.assign_non_tensor(
-            batch_td,
+        critic_meta = dict(
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
             epochs=ppo_epochs,
@@ -1355,13 +1388,15 @@ class RayPPOTrainer:
             dataloader_kwargs={"shuffle": shuffle},
         )
 
-        output = self.critic_wg.train_mini_batch(batch_td)
+        prepared = self.data_plane.prepare_training(batch, critic_meta)
+        output = self.critic_wg.train_mini_batch(prepared.payload)
         output = output.get()
-        output = tu.get(output, "metrics")
+        output = self.data_plane.collect_metrics(output)
+
         output = rename_dict(output, "critic/")
         # modify key name
         output["perf/mfu/critic"] = output.pop("critic/mfu")
-        critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
+        critic_output = batch.new_like(meta_info={"metrics": output})
         return critic_output
 
     def fit(self):
@@ -1437,7 +1472,10 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                self.data_plane.reset_materialize_stats()
+
+                with marked_timer("dataplane/from_single_dict", timing_raw):
+                    batch: DataProto = self.data_proto_cls.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 # add uid to batch
@@ -1445,26 +1483,30 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                gen_batch = self._get_gen_batch(batch)
+                with marked_timer("dataplane/get_gen_batch", timing_raw):
+                    gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 rollout_n = self.config.actor_rollout_ref.rollout.n
-                gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                with marked_timer("dataplane/repeat_prepare", timing_raw):
+                    gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
 
-                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                    # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
-                    # Keep them in a single agent-loop/vLLM request to avoid sending a second
-                    # rollout after replicas have been put to sleep, which can leave async vLLM
-                    # engines in an invalid state for multi-turn agent workloads.
-                    gen_batch_output.non_tensor_batch["__do_sample__"] = np.ones(len(gen_batch_output), dtype=bool)
-                    gen_baseline_batch = gen_batch.slice(0, None)
-                    gen_baseline_batch.non_tensor_batch["__do_sample__"] = np.zeros(len(gen_baseline_batch), dtype=bool)
-                    combined_gen_batch = DataProto.concat([gen_batch_output, gen_baseline_batch])
-                    num_sampled_prompts = len(gen_batch_output)
-                else:
-                    combined_gen_batch = gen_batch_output
-                    num_sampled_prompts = len(gen_batch_output)
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
+                        # Keep them in a single agent-loop/vLLM request to avoid sending a second
+                        # rollout after replicas have been put to sleep, which can leave async vLLM
+                        # engines in an invalid state for multi-turn agent workloads.
+                        gen_batch_output.non_tensor_batch["__do_sample__"] = np.ones(len(gen_batch_output), dtype=bool)
+                        gen_baseline_batch = gen_batch.slice(0, None)
+                        gen_baseline_batch.non_tensor_batch["__do_sample__"] = np.zeros(
+                            len(gen_baseline_batch), dtype=bool
+                        )
+                        combined_gen_batch = gen_batch_output.concat([gen_batch_output, gen_baseline_batch])
+                        num_sampled_prompts = len(gen_batch_output)
+                    else:
+                        combined_gen_batch = gen_batch_output
+                        num_sampled_prompts = len(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1499,8 +1541,9 @@ class RayPPOTrainer:
                         del gen_baseline_output
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    with marked_timer("dataplane/repeat_union_gen", timing_raw):
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1510,6 +1553,12 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+
+                    with marked_timer("dataplane/prefetch_gen", timing_raw):
+                        self.data_plane.prefetch(
+                            batch,
+                            ["responses", "attention_mask", "input_ids", "response_mask"],
+                        )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1546,6 +1595,8 @@ class RayPPOTrainer:
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            self.data_plane.prefetch(old_log_prob, ["entropys"])
+                            self.data_plane.prefetch(batch, ["response_mask"])
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1560,7 +1611,8 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
+                            # Drop entropy column without a second materialize (Neo pop is ref-only).
+                            old_log_prob.pop(batch_keys=["entropys"])
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
@@ -1597,6 +1649,30 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        # Pull advantage inputs before driver-side GAE/KL touches
+                        # several columns. GAE stays on the driver so whitening
+                        # keeps the classic global-batch semantics.
+                        adv_estimator = self.config.algorithm.adv_estimator
+                        with marked_timer("dataplane/prefetch_adv", timing_raw):
+                            self.data_plane.prefetch(
+                                batch,
+                                [
+                                    "token_level_scores",
+                                    "token_level_rewards",
+                                    "values",
+                                    "response_mask",
+                                    "old_log_probs",
+                                    "ref_log_prob",
+                                    "attention_mask",
+                                    "responses",
+                                    "advantages",
+                                    "returns",
+                                    "sum_pi_squared",
+                                    "rollout_is_weights",
+                                    "reward_baselines",
+                                ],
+                            )
+
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
@@ -1621,27 +1697,33 @@ class RayPPOTrainer:
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
-                        # compute advantages, executed on the driver process
+                        # Compute advantages on the driver, matching DataProto.
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
                         batch = compute_advantage(
                             batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
+                            adv_estimator=adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        batch.clear_cache()
+
+                    correctness_dump_dir = self.config.trainer.get("correctness_dump_dir", None)
+                    if correctness_dump_dir:
+                        with marked_timer("dump_correctness_tensors", timing_raw):
+                            self._dump_correctness_tensors(batch, correctness_dump_dir)
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
-
                     # implement critic warmup
                     if self.config.trainer.critic_warmup > self.global_steps:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
@@ -1712,6 +1794,8 @@ class RayPPOTrainer:
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
+                timing_raw.update(self.data_plane.pop_materialize_stats())
+
                 # training metrics
                 metrics.update(
                     {
@@ -1719,7 +1803,24 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
-                # collect metrics
+                # Collect metrics with the classic global reductions. Averaging
+                # per-rank masked means / explained variance is not equivalent
+                # when ranks contain different numbers of valid response tokens.
+                with marked_timer("dataplane/prefetch_metrics", timing_raw):
+                    self.data_plane.prefetch(
+                        batch,
+                        [
+                            "token_level_scores",
+                            "token_level_rewards",
+                            "advantages",
+                            "returns",
+                            "values",
+                            "prompts",
+                            "responses",
+                            "response_mask",
+                            "attention_mask",
+                        ],
+                    )
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
