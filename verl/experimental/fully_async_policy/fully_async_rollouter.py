@@ -27,6 +27,7 @@ from omegaconf import DictConfig, open_dict
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
+    await_task_ignore_cancel,
     prepare_single_generation_data,
     safe_create_task,
 )
@@ -927,7 +928,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                             async with self.lock:
                                 for task in actual_done:
                                     self.active_tasks.discard(task)
-                                    await task
+                                    await await_task_ignore_cancel(task)
                                 self._record_active_count()
                         if resume_future in done:
                             print(
@@ -962,7 +963,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
                             for task in done_tasks:
-                                await task
+                                await await_task_ignore_cancel(task)
                             self._record_active_count()
                 break
 
@@ -974,7 +975,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                         )
                         for task in done_tasks:
-                            await task
+                            await await_task_ignore_cancel(task)
                         self._record_active_count()
 
             # Submit single sample processing

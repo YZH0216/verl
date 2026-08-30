@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import ray
 import torch
 
 from verl import DataProto
@@ -441,11 +442,37 @@ def task_exception_handler(task: asyncio.Task):
     """Handle task exceptions and log them"""
     try:
         task.result()
-    except asyncio.CancelledError:
-        pass  # Task was cancelled, this is expected
+    except (asyncio.CancelledError, ray.exceptions.TaskCancelledError):
+        # Task was cancelled, this is expected. Ray surfaces the cancellation of a
+        # remote task as ray.exceptions.TaskCancelledError rather than
+        # asyncio.CancelledError, so both must be exempted here.
+        pass
     except Exception as e:
         print(f"Task {task.get_name()} failed with exception: {e}")
         raise e
+
+
+async def await_task_ignore_cancel(task: asyncio.Task) -> None:
+    """Await a task taken from an ``asyncio.wait(..., FIRST_COMPLETED)`` result set,
+    swallowing cancellation instead of letting it propagate into the caller.
+
+    Same exemption as :func:`task_exception_handler`, and for the same reason: when
+    ``partial_rollout`` is enabled, a parameter sync interrupts in-flight rollout
+    generation tasks, and re-awaiting such a task raises
+    ``ray.exceptions.TaskCancelledError`` (not ``asyncio.CancelledError``). The
+    coroutines that drain ``done_tasks`` do not wrap that ``await`` in a try/except,
+    so without this a routine parameter sync escapes as an uncaught exception and
+    takes down the whole Rollouter actor over what is meant to be a transparent
+    interruption.
+
+    Note this only prevents the crash: the cancelled sample is dropped, not
+    resubmitted. Making ``partial_rollout`` actually resume the interrupted sample
+    is a separate, larger change.
+    """
+    try:
+        await task
+    except (asyncio.CancelledError, ray.exceptions.TaskCancelledError) as e:
+        print(f"Task {task.get_name()} cancelled ({type(e).__name__}); sample dropped")
 
 
 def safe_create_task(coro, name: str, task_set: set = None):
