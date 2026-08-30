@@ -176,7 +176,7 @@ class ReadableOperation:
 
 class ReadOperation:
     """Encapsulates a read operation from remote agent.
-    1. read medata from remote agent
+    1. read metadata from remote agent
     2. start read transfer operation
     3. wait until read complete
 

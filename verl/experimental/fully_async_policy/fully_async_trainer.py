@@ -539,7 +539,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         Flow:
         1. Pre-step processing -> 2. Get batch -> 3. Generate sequences ->
-        4. Compute reward -> 5. Compute log_prob -> 6. Compute reward ->
+        4. Compute reward -> 5. Compute log_prob -> 6. Compute ref log_prob ->
         7. Compute advantage -> 8. Update critic -> 9. Update actor -> 10. Post-step processing
 
         Args:
