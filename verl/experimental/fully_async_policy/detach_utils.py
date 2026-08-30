@@ -62,8 +62,12 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
             non_tensor_batch_keys=existing_non_tensor_keys,
         )
 
-    # Setting selected agent, that supports partial
-    if not config.actor_rollout_ref.rollout.multi_turn.enable:
+    # Setting selected agent, that supports partial.
+    # Only fill in the default: the dataset may select an agent loop per sample, and
+    # AgentLoopWorker.generate_sequences applies its own default the same way (it fills
+    # config.agent.default_agent_loop only when the column is absent). Overwriting an
+    # agent_name the dataset provided silently discards the caller's agent loop.
+    if not config.actor_rollout_ref.rollout.multi_turn.enable and "agent_name" not in full_batch.non_tensor_batch:
         full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
 
     # Add global step count to generated data
