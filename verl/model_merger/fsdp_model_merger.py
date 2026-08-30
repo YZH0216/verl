@@ -199,7 +199,18 @@ class FSDPModelMerger(BaseModelMerger):
                     # 2-D list, FSDP + TP
                     raise NotImplementedError("FSDP + TP is not supported yet")
             else:
-                state_dict[key] = torch.cat(state_dict[key], dim=0)
+                # Entries that are not DTensors were never sharded by FSDP: buffers (and any
+                # parameter excluded from wrapping) are replicated, so every rank holds an
+                # identical full copy. Concatenating them yields a world_size-times oversized
+                # tensor and a merged checkpoint that cannot be loaded. This mirrors what
+                # _merge_by_placement already does for an explicit Replicate() placement.
+                shards = state_dict[key]
+                ref_shape = shards[0].shape
+                assert all(t.shape == ref_shape for t in shards), (
+                    f"Expected replicated tensor {key} to have the same shape on every rank, "
+                    f"got {[tuple(t.shape) for t in shards]}"
+                )
+                state_dict[key] = shards[0]
 
         return state_dict
 
