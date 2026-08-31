@@ -107,15 +107,6 @@ class GlobalRequestLoadBalancer:
             # which varies run-to-run, so it is bypassed entirely here.
             server_id = list(self._servers)[hash(request_id) % len(self._servers)]
         else:
-            # Break ties RANDOMLY rather than by dict order. Inflight counts are equal
-            # whenever the pool is idle -- always at startup, and routinely at low
-            # concurrency -- and `candidates[0]` then resolves to the same replica every
-            # time. Because the choice is pinned by the sticky-session cache above for
-            # the whole (potentially multi-turn) request, a deterministic tie-break makes
-            # load avalanche onto one replica while the rest sit idle. Picking uniformly
-            # among the equally-least-loaded replicas fans new sessions out; only the
-            # first turn of a session is affected, so sticky prefix caching is preserved.
-            # Reproducible routing is available via `full_determinism` above.
             min_count = min(self._inflight_requests.values())
             candidates = [sid for sid, count in self._inflight_requests.items() if count == min_count]
             server_id = random.choice(candidates)
